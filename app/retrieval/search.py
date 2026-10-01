@@ -29,6 +29,8 @@ def search(
             """
             SELECT
                 content,
+                source,
+                chunk_index,
                 1 - (embedding <=> %s::vector) AS similarity
             FROM document_chunks
             WHERE source = %s
@@ -51,6 +53,8 @@ def search(
             """
             SELECT
                 content,
+                source,
+                chunk_index,
                 1 - (embedding <=> %s::vector) AS similarity
             FROM document_chunks
             WHERE 1 - (embedding <=> %s::vector) >= %s
@@ -114,9 +118,11 @@ if __name__ == "__main__":
 
         print(f"\nQuery: {query}")
 
-        for content, similarity in results:
+        for content, source, chunk_index, similarity in results:
 
             print(f"Similarity: {similarity}")
+            print(f"Source: {source}")
+            print(f"Chunk: {chunk_index}")
 
             print(
                 f"Content: {content[:50]}..."
