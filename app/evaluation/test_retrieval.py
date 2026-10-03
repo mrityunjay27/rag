@@ -1,74 +1,9 @@
 from app.evaluation.dataset import evaluation_data
-from app.retrieval.search import search
+from app.evaluation.recall import calculate_recall_at_k
+from app.evaluation.precision import calculate_precision_at_k
+from app.evaluation.reciprocal_rank import calculate_reciprocal_rank
+from app.evaluation.context_relevance_metric import calculate_context_relevance
 
-
-def calculate_recall_at_k(
-    query: str,
-    expected_evidence: str,
-    k: int,
-) -> int:
-
-    results = search(
-        query=query,
-        top_k=k,
-        similarity_threshold=0.0,
-    )
-
-    for content, source, chunk_index, similarity in results:
-
-        if expected_evidence.lower() in content.lower():
-            return 1
-
-    return 0
-
-
-def calculate_precision_at_k(
-    query: str,
-    expected_evidence: str,
-    k: int,
-) -> float:
-
-    results = search(
-        query=query,
-        top_k=k,
-        similarity_threshold=0.0,
-    )
-
-    if not results:
-        return 0.0
-
-    relevant_chunks = 0
-
-    for content, source, chunk_index, similarity in results:
-
-        if expected_evidence.lower() in content.lower():
-            relevant_chunks += 1
-
-    return relevant_chunks / len(results)
-
-def calculate_reciprocal_rank(
-    query: str,
-    expected_evidence: str,
-    k: int,
-) -> float:
-
-    results = search(
-        query=query,
-        top_k=k,
-        similarity_threshold=0.0,
-    )
-
-    for rank, (
-        content,
-        source,
-        chunk_index,
-        similarity,
-    ) in enumerate(results, start=1):
-
-        if expected_evidence.lower() in content.lower():
-            return 1 / rank
-
-    return 0.0
 
 if __name__ == "__main__":
 
@@ -106,6 +41,11 @@ if __name__ == "__main__":
                 k=k,
             )
 
+            context_relevance = calculate_context_relevance(
+                query=query,
+                k=k,
+            )
+
             correct += recall
             precision_sum += precision
             reciprocal_rank_sum += reciprocal_rank
@@ -115,7 +55,7 @@ if __name__ == "__main__":
             print(f"Recall@{k}: {'YES' if recall else 'NO'}")
             print(f"Precision@{k}: {precision:.2%}")
             print(f"Reciprocal Rank: {reciprocal_rank:.2f}")
-
+            print(f"Context Relevance: {context_relevance:.2%}")
         recall = correct / len(evaluation_data)
         precision = precision_sum / len(evaluation_data)
         mrr = reciprocal_rank_sum / len(evaluation_data)
