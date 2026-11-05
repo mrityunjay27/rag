@@ -26,3 +26,9 @@ FROM document_chunks
 ORDER BY embedding <=> %s
 LIMIT 3;
 
+-- For Keyword search, create a GIN index on the content column to speed up full-text search queries.
+CREATE INDEX document_chunks_content_fts_idx
+ON document_chunks
+USING GIN (
+    to_tsvector('english', content)
+);
