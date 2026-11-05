@@ -2,7 +2,7 @@
 
 Personal study notes covering everything learned about **Retrieval-Augmented Generation**, in the order it was learned.
 
-**Scope:** Concepts and mental models only — implementation, code and library usage are intentionally excluded.
+**Scope:** Concepts and mental models, plus implementation notes that emerged while building the project.
 **Context:** Learner already knows Python, Django, PostgreSQL, Kafka, Redis and microservices, so RAG was studied at an engineering/deep level rather than as "how to call an LLM API".
 
 ---
@@ -24,7 +24,7 @@ Personal study notes covering everything learned about **Retrieval-Augmented Gen
 13. [Clarification — What Exactly Is a Reranker?](#13-clarification--what-exactly-is-a-reranker)
 14. [Decision Point — Start Implementing](#14-decision-point--start-implementing)
 15. [Stack Decisions — Embedding and Generation Providers](#15-stack-decisions--embedding-and-generation-providers)
-16. [Roadmap Ahead — Not Yet Covered](#16-roadmap-ahead--not-yet-covered)
+16. [Roadmap — Completed and Ahead](#16-roadmap--completed-and-ahead)
 17. [Master Mental Models and Reference Tables](#17-master-mental-models-and-reference-tables)
 18. [Common Misconceptions — Correct Answers](#18-common-misconceptions--correct-answers)
 19. [Self-Check Question Bank](#19-self-check-question-bank)
@@ -2252,7 +2252,26 @@ Documents appearing highly in multiple retrieval methods become strong candidate
 
 > **RRF combines rankings rather than directly comparing incompatible scores.**
 
-No need to memorise the formula yet.
+The formula, once you need it:
+
+```text
+RRF(d) = Σ  1 / (k + rank_i(d))
+         i
+```
+
+- `rank_i(d)` is the 1-based position of document `d` in retrieval list `i`.
+- `k` is a smoothing constant, conventionally **60**, which dampens the advantage of very high ranks.
+- A document missing from a list simply contributes nothing from that list.
+
+Worked example with `k = 60`:
+
+```text
+A → vector rank 1, keyword rank 2 → 1/61 + 1/62 ≈ 0.0325
+C → vector rank 3, keyword rank 1 → 1/63 + 1/61 ≈ 0.0323
+D → vector rank 4, keyword rank 3 → 1/64 + 1/63 ≈ 0.0315
+```
+
+A wins because it ranks highly in **both** lists — which is exactly the behaviour RRF is designed to reward.
 
 ### 12.20 The retrieval pipeline grows
 
@@ -2500,6 +2519,29 @@ An application where you upload documents and ask questions about their content.
 - **Batch embedding** is worth using later; one API request per chunk is wasteful.
 - **The embedding dimension must be fixed in the database.** If a model produces 384-dim vectors, the pgvector column is `VECTOR(384)`; if 1536, then `VECTOR(1536)`.
 
+### 14.4 Hybrid search implementation notes (V3)
+
+Hybrid retrieval was implemented after the evaluation layer. The shape built:
+
+```text
+Query ─┬─ Vector search  (pgvector cosine) ─┐
+       └─ Keyword search (Postgres FTS)  ───┴─ RRF fusion → ranked chunks
+```
+
+- **Vector branch** — embed the query, then rank chunks by `1 - cosine_distance` (pgvector `<=>` operator), optionally filtered by `source` and a `similarity_threshold`.
+- **Keyword branch** — Postgres full-text search: `to_tsvector('english', content)` matched against `websearch_to_tsquery('english', query)` and ranked with `ts_rank_cd`.
+- **Fusion** — Reciprocal Rank Fusion over the two ranked lists. Chunks are keyed by `(source, chunk_index)`, and each chunk's score is the sum of `1 / (k + rank)` across lists, with `k = 60`. Only rank positions matter, so the incompatible vector-similarity and `ts_rank_cd` scales never have to be compared directly.
+- **Indexing** — keyword search is backed by a GIN index on `to_tsvector('english', content)`. Without it, full-text search degrades to a sequential scan.
+- **Result shape** — fusion returns `(chunk, rrf_score)` pairs. The per-branch score (similarity vs. keyword rank) is not preserved, so downstream code must not assume the fourth field of `chunk` is a similarity.
+
+Status at the time of writing:
+
+- **Implemented and compiling:** `app/retrieval/keyword_search.py`, `app/retrieval/hybrid_search.py`
+- **Manual smoke scripts only:** `test_keyword_search.py`, `test_hybrid_search.py` (print output, no assertions)
+- **Not yet wired into `app/rag.py`** — the end-to-end pipeline still uses vector-only `search`
+- **Not yet evaluated** — the evaluation runner and metric modules still import vector-only `search`
+- **Not yet capped to `top_k` after fusion** — can return up to `2 * top_k` unique chunks
+
 ---
 
 ## 15. Stack Decisions — Embedding and Generation Providers
@@ -2521,35 +2563,51 @@ A local `sentence-transformers` model such as `all-MiniLM-L6-v2`:
 
 This is a sensible free alternative if you want to avoid any paid embedding API.
 
-### 15.3 Decision — keep OpenAI embeddings
+### 15.3 Final decision — local SentenceTransformer embeddings
+
+OpenAI `text-embedding-3-small` was considered first (1,536 dimensions, roughly $0.02 / 1M input tokens), but the implementation uses a **local SentenceTransformer** model instead:
 
 ```text
 Component            Technology                        Cost
 ─────────────────────────────────────────────────────────────
-Embeddings           OpenAI text-embedding-3-small     $0.02 / 1M input tokens
+Embeddings           all-MiniLM-L6-v2 (local)          Free
+Vector dimension     384                               —
 Vector database      PostgreSQL + pgvector             Free, self-hosted
 LLM generation       Groq                              Free tier, usage limits
 Backend (later)      FastAPI                           —
 ```
 
-- `text-embedding-3-small` produces **1,536-dimensional** vectors by default.
-- Approximate embedding-only costs: 10,000 tokens ≈ $0.0002; 100,000 tokens ≈ $0.002; 1 million tokens ≈ $0.02. These exclude LLM generation costs.
-- OpenAI API access is billed by usage; do not assume free credits.
-- Conclusion: embeddings are inexpensive for a small learning project, so keep the original OpenAI-based embedding code and use Groq's free tier for generation.
+- The model downloads on first run, then runs locally — no API key and no per-token cost.
+- It produces **384-dimensional** vectors, so the pgvector column is `VECTOR(384)`.
+- Trade-off: local compute and model management, but no external embedding dependency.
+- OpenAI embeddings remain a valid alternative. Switching to them later means changing the model **and** re-embedding/re-indexing everything into a 1,536-dimensional space — you cannot mix vector spaces.
 
 ---
 
-## 16. Roadmap Ahead — Not Yet Covered
+## 16. Roadmap — Completed and Ahead
 
-The following are planned/planned-but-not-yet-taught.
+Status of the planned roadmap.
 
-### 16.1 Lesson 10 — RAG Evaluation (next)
+### 16.1 Lesson 10 — RAG Evaluation (implemented)
 
 The critical engineering question:
 
 > **How do you know whether your RAG system is actually good?**
 
-Planned coverage: **Recall@K, Precision@K, MRR, context relevance, faithfulness, answer correctness**, and using an LLM to evaluate a RAG pipeline.
+Covered and implemented: **Recall@K, Precision@K, MRR, context relevance, faithfulness, answer correctness**, and using an LLM to evaluate a RAG pipeline. Detailed implementation notes live in `PROJECT_EVALUATION_PROGRESS.md`.
+
+Implemented metric modules in `app/evaluation/`:
+
+| Metric | File | Evaluates |
+|---|---|---|
+| Recall@K | `recall.py` | Did we retrieve the needed evidence? |
+| Precision@K | `precision.py` | How much retrieved content is relevant? |
+| Reciprocal Rank / MRR | `reciprocal_rank.py` | How high did relevant evidence rank? |
+| Context Relevance | `context_relevance.py`, `context_relevance_metric.py` | Is the retrieved context useful for the query? |
+| Faithfulness | `faithfulness.py` | Is the answer supported by the context? |
+| Answer Correctness | `answer_correctness.py` | Is the final answer correct? |
+
+The evaluation runner (`test_retrieval.py`) currently scores **vector-only** retrieval; extending it to compare vector, keyword, and hybrid retrieval is the next step.
 
 Evaluation structure from the roadmap:
 
@@ -2579,16 +2637,20 @@ relevant_document
 
 > Evaluation is described as **very important** for RAG knowledge that is useful in interviews and production.
 
-### 16.2 Still ahead from the original roadmap
+### 16.2 Completed since the roadmap was written
+
+- **Hybrid retrieval (V3)** — Postgres keyword search + pgvector vector search, fused with Reciprocal Rank Fusion. Implemented in `app/retrieval/`; integration into the end-to-end pipeline and the evaluation runner is still pending.
+
+### 16.3 Still ahead from the original roadmap
 
 - **Advanced RAG:** query rewriting, multi-query RAG, HyDE (Hypothetical Document Embeddings), parent-child retrieval, contextual retrieval, Graph RAG (moving from `chunks → vectors` toward `entities → relationships → graph`)
 - **Production RAG:** caching, async ingestion, Kafka-driven ingestion, background workers, rate limiting, auth, multi-tenancy, observability, cost tracking, streaming, retries, dead-letter queues, document versioning
 - **Project phases:** FastAPI service, conversation history, citations
 - **Frameworks (deliberately last):** LangChain, LlamaIndex, LangGraph, agents, tools, structured output, function/tool calling
 
-### 16.3 Open question carried forward
+### 16.4 Open question carried forward
 
-> **How do we know your RAG system is good?** — Answering this is the next major step.
+> **How do we know your RAG system is good?** — The evaluation framework now exists to answer this. The remaining question is **which retrieval strategy scores best**, which requires running the same metrics against vector, keyword, and hybrid retrieval.
 
 ---
 
@@ -2824,6 +2886,14 @@ LLM              →  GENERATE
 1. Is a reranker another search, or a model? What is it usually?
 2. How does a cross-encoder differ from a bi-encoder/embedding model?
 3. Why is reranking applied to a small candidate set?
+
+### After implementing hybrid search
+
+1. Why can't the vector similarity score and the `ts_rank_cd` score be added together directly?
+2. In RRF, why does a document that ranks highly in *both* lists beat one that ranks first in only one list?
+3. What is the role of `k = 60` in `1 / (k + rank)`?
+4. Why does the keyword branch need a GIN index, and what happens without one?
+5. Why is "implemented" not the same as "integrated" in a RAG pipeline?
 
 ---
 

@@ -17,7 +17,7 @@ RAG SYSTEM
   RETRIEVAL    EVALUATION        GENERATION
     │              │                 │
     ↓              ↓                 ↓
-Search (Vector)  Metrics           LLM Answer
+Vector + Keyword  Metrics           LLM Answer
 ```
 
 ### 1. Retrieval Layer (`app/retrieval/`)
@@ -26,6 +26,16 @@ Search (Vector)  Metrics           LLM Answer
   - Converts similarity: `1 - cosine_distance` to get similarity score
   - Supports filtering by source, similarity threshold, and top_k
   - Returns tuples: `(content, source, chunk_index, similarity)`
+- **`keyword_search.py`**: Implements Postgres full-text keyword search
+  - Matches `to_tsvector('english', content)` against `websearch_to_tsquery('english', query)`
+  - Ranks with `ts_rank_cd`
+  - Backed by the GIN index `document_chunks_content_fts_idx` (see `pgvecor_setup.sql`)
+  - Returns tuples: `(content, source, chunk_index, score)`
+- **`hybrid_search.py`**: Combines vector + keyword results using Reciprocal Rank Fusion (RRF)
+  - Keys chunks by `(source, chunk_index)` and sums `1 / (k + rank)` across both ranked lists (`k = 60`)
+  - Returns `(chunk, rrf_score)` pairs
+
+> **Status:** Hybrid search is implemented and compiles, but is **not yet wired into `app/rag.py`** or the evaluation runner — both still use vector-only `search`. It is also not yet capped to `top_k` after fusion.
 
 ### 2. Embeddings Layer (`app/embeddings/`)
 - **`embedder.py`**: Generates embeddings using SentenceTransformer
